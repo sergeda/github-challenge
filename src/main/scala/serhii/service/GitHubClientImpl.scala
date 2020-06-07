@@ -3,22 +3,24 @@ package serhii.service
 import cats.effect.Concurrent
 import cats.effect.implicits._
 import cats.implicits._
-import cats.{Applicative, FlatMap, MonadError, Parallel}
+import cats.{Applicative, FlatMap, Parallel}
 import com.typesafe.scalalogging.LazyLogging
 import io.circe.Decoder
 import io.circe.parser.decode
 import serhii.model.{Contributor, GitHubRepository}
+import serhii.utils.Effects._
 import serhii.utils.Errors.{DecodingJsonError, RateLimited, UnknownGitHubError}
 import sttp.client._
 
 import scala.concurrent.duration._
 import scala.util.Try
 
-class GitHubClientImpl[F[_]: Concurrent: Parallel](val token: String, val concurrency: Int, val timeout: Int)(
-             implicit m: MonadError[F, Throwable],
-             val backend: SttpBackend[F, Nothing, NothingT]
+class GitHubClientImpl[F[_]: Concurrent: Parallel: MonadThrow](val token: String, val concurrency: Int, val timeout: Int)(
+             implicit val backend: SttpBackend[F, Nothing, NothingT]
 ) extends GitHubClient[F]
     with LazyLogging {
+
+  type ClientResponse = Response[Either[String, String]]
 
   private val RateLimitRemainingHeader = "X-RateLimit-Remaining"
   private val RateLimitResetTimeHeader = "X-RateLimit-Reset"
@@ -31,23 +33,20 @@ class GitHubClientImpl[F[_]: Concurrent: Parallel](val token: String, val concur
     rateLimitReset = value
   }
 
-  private def checkAndParse[T](request: F[Response[Either[String, String]]], f: F[Response[Either[String, String]]] => F[Vector[T]]): F[Vector[T]] =
+  private def checkAndParse[T](request: F[ClientResponse], f: F[ClientResponse] => F[Vector[T]]): F[Vector[T]] =
     for {
       _ <- checkAndUpdateIfLimited(request)
       result <- f(request)
     } yield result
 
-  protected def getDataFromPages[T](
-               parseFunction: F[Response[Either[String, String]]] => F[Vector[T]],
-               formRequestFunction: Int => F[Response[Either[String, String]]]
-  ): F[Vector[T]] = {
+  protected def getDataFromPages[T](parseFunction: F[ClientResponse] => F[Vector[T]], formRequestFunction: Int => F[ClientResponse]): F[Vector[T]] = {
     val firstRequest = formRequestFunction(1)
     val task = for {
       firstPageRes <- checkAndParse(firstRequest, parseFunction)
       lastPage <- firstRequest.map(resp => getPageCount(resp))
     } yield {
       val pages = (2 to lastPage).map { page =>
-        val request: F[Response[Either[String, String]]] = formRequestFunction(page)
+        val request: F[ClientResponse] = formRequestFunction(page)
         checkAndParse(request, parseFunction)
       }.toVector
       Concurrent[F].parTraverseN(concurrency)(pages)(identity).map(_.flatten).map(_ ++ firstPageRes)
@@ -76,26 +75,26 @@ class GitHubClientImpl[F[_]: Concurrent: Parallel](val token: String, val concur
       .sortBy(_.contributions)(Ordering.Int.reverse)
   }
 
-  private def formRepositoriesRequest(page: Int, organization: String, token: String): F[Response[Either[String, String]]] = {
+  private def formRepositoriesRequest(page: Int, organization: String, token: String): F[ClientResponse] = {
     formRequest(s"https://api.github.com/orgs/$organization/repos?page=$page", token)
   }
 
-  private def formContributorsRequest(page: Int, url: String, token: String): F[Response[Either[String, String]]] = {
+  private def formContributorsRequest(page: Int, url: String, token: String): F[ClientResponse] = {
     formRequest(s"$url?page=$page", token)
   }
 
-  private def formRequest(url: String, token: String): F[Response[Either[String, String]]] = {
+  private def formRequest(url: String, token: String): F[ClientResponse] = {
     resetLimitedStatus().fold {
       basicRequest.get(uri"$url").header("Authorization", s"token $token", true).response(asString("UTF-8")).readTimeout(timeout.seconds).send()
-    }(time => m.raiseError(RateLimited(time)))
+    }(time => (RateLimited(time).raiseError[F, ClientResponse]))
 
   }
 
-  private def checkAndUpdateIfLimited(response: F[Response[Either[String, String]]]): F[Response[Either[String, String]]] = {
+  private def checkAndUpdateIfLimited(response: F[ClientResponse]): F[ClientResponse] = {
     implicitly[FlatMap[F]].flatMap(response) { resp =>
       getRateLimitTimeIfLimited(resp).fold(Applicative[F].pure(resp)) { time =>
         setRateLimitResetStatus(Some(time))
-        m.raiseError(RateLimited(time))
+        (RateLimited(time)).raiseError[F, ClientResponse]
       }
     }
   }
@@ -111,7 +110,7 @@ class GitHubClientImpl[F[_]: Concurrent: Parallel](val token: String, val concur
     }
   }
 
-  private def getRateLimitTimeIfLimited(response: Response[Either[String, String]]): Option[Long] = {
+  private def getRateLimitTimeIfLimited(response: ClientResponse): Option[Long] = {
     if (response.code.code == 403) {
       val remaining = response.header(RateLimitRemainingHeader).flatMap(rem => Try(rem.toInt).toOption)
       val resetTime = response.header(RateLimitResetTimeHeader).flatMap(rem => Try(rem.toLong).toOption)
@@ -123,7 +122,7 @@ class GitHubClientImpl[F[_]: Concurrent: Parallel](val token: String, val concur
     } else None
   }
 
-  private def getPageCount(response: Response[Either[String, String]]): Int = {
+  private def getPageCount(response: ClientResponse): Int = {
     if (response.code.isSuccess) {
       response
         .header("Link")
@@ -142,19 +141,19 @@ class GitHubClientImpl[F[_]: Concurrent: Parallel](val token: String, val concur
     }
   }
 
-  private def parseRepositoryResponse(response: F[Response[Either[String, String]]]): F[Vector[GitHubRepository]] =
+  private def parseRepositoryResponse(response: F[ClientResponse]): F[Vector[GitHubRepository]] =
     parseResponse[Vector[GitHubRepository]](response)
 
-  private def parseContributorResponse(response: F[Response[Either[String, String]]]): F[Vector[Contributor]] =
+  private def parseContributorResponse(response: F[ClientResponse]): F[Vector[Contributor]] =
     parseResponse[Vector[Contributor]](response)
 
-  private def parseResponse[T: Decoder](response: F[Response[Either[String, String]]]): F[T] = {
+  private def parseResponse[T: Decoder](response: F[ClientResponse]): F[T] = {
     FlatMap[F].flatMap(response) { resp =>
       if (resp.code.isSuccess) {
-        resp.body.fold(err => m.raiseError(UnknownGitHubError(err)), body => {
-          decode[T](body).fold(err => m.raiseError(DecodingJsonError(err.getMessage)), Applicative[F].pure(_))
+        resp.body.fold(err => UnknownGitHubError(err).raiseError[F, T], body => {
+          decode[T](body).fold(err => DecodingJsonError(err.getMessage).raiseError[F, T], Applicative[F].pure(_))
         })
-      } else m.raiseError(UnknownGitHubError(resp.statusText))
+      } else UnknownGitHubError(resp.statusText).raiseError[F, T]
     }
 
   }
